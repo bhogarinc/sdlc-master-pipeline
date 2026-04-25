@@ -1,0 +1,29 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: taskflow-blue
+  labels:
+    environment: blue
+    app: taskflow-pro
+    deployment-strategy: blue-green
+    istio-injection: enabled
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: taskflow-green
+  labels:
+    environment: green
+    app: taskflow-pro
+    deployment-strategy: blue-green
+    istio-injection: enabled
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: taskflow-shared
+  labels:
+    environment: shared
+    app: taskflow-pro
+    purpose: shared-resources
+    istio-injection: enabled
