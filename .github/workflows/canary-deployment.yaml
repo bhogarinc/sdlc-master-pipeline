@@ -1,0 +1,706 @@
+name: Canary Deployment Pipeline
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, closed]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+        - staging
+        - production-canary
+        - production
+      skip_tests:
+        description: 'Skip test execution'
+        required: false
+        default: false
+        type: boolean
+      canary_weight:
+        description: 'Manual canary weight override (%)'
+        required: false
+        default: ''
+        type: string
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME_API: bhogarinc/taskflow-api
+  IMAGE_NAME_WEB: bhogarinc/taskflow-web
+  HELM_VERSION: '3.13.0'
+  KUBECTL_VERSION: '1.28.0'
+  FLUX_VERSION: '2.1.0'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ==========================================
+  # BUILD & TEST PHASE
+  # ==========================================
+  build-api:
+    name: Build API Docker Image
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tags }}
+      image_digest: ${{ steps.build.outputs.digest }}
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Log in to Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_API }}
+        tags: |
+          type=ref,event=branch
+          type=semver,pattern={{version}}
+          type=semver,pattern={{major}}.{{minor}}
+          type=sha,prefix=,suffix=,format=short
+
+    - name: Build and push API image
+      id: build
+      uses: docker/build-push-action@v5
+      with:
+        context: ./backend
+        file: ./backend/Dockerfile
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        platforms: linux/amd64,linux/arm64
+        build-args: |
+          BUILD_DATE=${{ github.event.head_commit.timestamp }}
+          VCS_REF=${{ github.sha }}
+          VERSION=${{ github.ref_name }}
+
+  build-web:
+    name: Build Web Docker Image
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tags }}
+      image_digest: ${{ steps.build.outputs.digest }}
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Log in to Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_WEB }}
+        tags: |
+          type=ref,event=branch
+          type=semver,pattern={{version}}
+          type=semver,pattern={{major}}.{{minor}}
+          type=sha,prefix=,suffix=,format=short
+
+    - name: Build and push Web image
+      id: build
+      uses: docker/build-push-action@v5
+      with:
+        context: ./frontend
+        file: ./frontend/Dockerfile
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        platforms: linux/amd64
+        build-args: |
+          NEXT_PUBLIC_API_URL=https://api.taskflow.pro
+          NEXT_PUBLIC_WS_URL=wss://ws.taskflow.pro
+
+  # ==========================================
+  # SECURITY & QUALITY GATES
+  # ==========================================
+  security-scan:
+    name: Security Scan
+    needs: [build-api, build-web]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Run Trivy vulnerability scanner - API
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_API }}:${{ github.sha }}
+        format: 'sarif'
+        output: 'trivy-api-results.sarif'
+        severity: 'CRITICAL,HIGH'
+
+    - name: Run Trivy vulnerability scanner - Web
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_WEB }}:${{ github.sha }}
+        format: 'sarif'
+        output: 'trivy-web-results.sarif'
+        severity: 'CRITICAL,HIGH'
+
+    - name: Upload API scan results
+      uses: github/codeql-action/upload-sarif@v2
+      with:
+        sarif_file: 'trivy-api-results.sarif'
+        category: 'api-container'
+
+    - name: Upload Web scan results
+      uses: github/codeql-action/upload-sarif@v2
+      with:
+        sarif_file: 'trivy-web-results.sarif'
+        category: 'web-container'
+
+  # ==========================================
+  # STAGING DEPLOYMENT
+  # ==========================================
+  deploy-staging:
+    name: Deploy to Staging
+    needs: [build-api, build-web, security-scan]
+    if: github.ref == 'refs/heads/main' || github.event.inputs.environment == 'staging'
+    runs-on: ubuntu-latest
+    environment:
+      name: staging
+      url: https://staging.taskflow.pro
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: us-east-1
+
+    - name: Update kubeconfig
+      run: |
+        aws eks update-kubeconfig --region us-east-1 --name taskflow-staging
+
+    - name: Deploy to Staging
+      run: |
+        # Update image tags
+        sed -i "s|image: bhogarinc/taskflow-api:.*|image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_API }}:${{ github.sha }}|g" k8s/staging/api-deployment.yaml
+        sed -i "s|image: bhogarinc/taskflow-web:.*|image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_WEB }}:${{ github.sha }}|g" k8s/staging/web-deployment.yaml
+        
+        # Apply manifests
+        kubectl apply -k k8s/staging/
+        
+        # Wait for rollout
+        kubectl rollout status deployment/taskflow-api -n staging --timeout=300s
+        kubectl rollout status deployment/taskflow-web -n staging --timeout=300s
+
+    - name: Run smoke tests
+      run: |
+        # Wait for services to be ready
+        sleep 30
+        
+        # Run smoke tests
+        curl -sf https://staging.taskflow.pro/health || exit 1
+        curl -sf https://api-staging.taskflow.pro/health/ready || exit 1
+
+  # ==========================================
+  # CANARY DEPLOYMENT - PRODUCTION
+  # ==========================================
+  canary-deploy:
+    name: Canary Deploy to Production
+    needs: [deploy-staging]
+    if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.environment == 'production-canary'
+    runs-on: ubuntu-latest
+    environment:
+      name: production-canary
+      url: https://app.taskflow.pro
+    outputs:
+      canary_id: ${{ steps.canary.outputs.canary_id }}
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: us-east-1
+
+    - name: Update kubeconfig
+      run: |
+        aws eks update-kubeconfig --region us-east-1 --name taskflow-production
+
+    - name: Deploy Canary - API
+      id: canary-api
+      run: |
+        # Create canary deployment
+        cat <<EOF | kubectl apply -f -
+        apiVersion: flagger.app/v1beta1
+        kind: Canary
+        metadata:
+          name: taskflow-api
+          namespace: production
+        spec:
+          targetRef:
+            apiVersion: apps/v1
+            kind: Deployment
+            name: taskflow-api
+          service:
+            port: 8000
+          analysis:
+            interval: 30s
+            threshold: 5
+            maxWeight: 100
+            stepWeight: 1
+            metrics:
+            - name: request-success-rate
+              thresholdRange:
+                min: 99
+              interval: 1m
+            - name: request-duration
+              thresholdRange:
+                max: 500
+              interval: 1m
+          progressDeadlineSeconds: 600
+        EOF
+        
+        # Trigger canary
+        kubectl set image deployment/taskflow-api \
+          api=${{ env.REGISTRY }}/${{ env.IMAGE_NAME_API }}:${{ github.sha }} \
+          -n production
+        
+        echo "canary_api_started=true" >> $GITHUB_OUTPUT
+
+    - name: Deploy Canary - Web
+      id: canary-web
+      run: |
+        kubectl set image deployment/taskflow-web \
+          web=${{ env.REGISTRY }}/${{ env.IMAGE_NAME_WEB }}:${{ github.sha }} \
+          -n production
+        
+        echo "canary_web_started=true" >> $GITHUB_OUTPUT
+
+    - name: Monitor Canary Progress
+      id: monitor
+      timeout-minutes: 90
+      run: |
+        echo "# Canary Deployment Progress" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        
+        MAX_WAIT=5400  # 90 minutes
+        START_TIME=$(date +%s)
+        
+        while true; do
+          CURRENT_TIME=$(date +%s)
+          ELAPSED=$((CURRENT_TIME - START_TIME))
+          
+          if [ $ELAPSED -gt $MAX_WAIT ]; then
+            echo "::error::Canary deployment timed out after 90 minutes"
+            exit 1
+          fi
+          
+          # Check API canary status
+          API_STATUS=$(kubectl get canary taskflow-api -n production -o jsonpath='{.status.phase}' 2>/dev/null || echo "Unknown")
+          API_WEIGHT=$(kubectl get canary taskflow-api -n production -o jsonpath='{.status.canaryWeight}' 2>/dev/null || echo "0")
+          
+          # Check Web canary status
+          WEB_STATUS=$(kubectl get canary taskflow-web -n production -o jsonpath='{.status.phase}' 2>/dev/null || echo "Unknown")
+          WEB_WEIGHT=$(kubectl get canary taskflow-web -n production -o jsonpath='{.status.canaryWeight}' 2>/dev/null || echo "0")
+          
+          echo "$(date '+%Y-%m-%d %H:%M:%S') - API: $API_STATUS (${API_WEIGHT}%) | Web: $WEB_STATUS (${WEB_WEIGHT}%)"
+          
+          # Update summary
+          echo "| Time | Service | Status | Weight |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|---------|--------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| $(date '+%H:%M:%S') | API | $API_STATUS | ${API_WEIGHT}% |" >> $GITHUB_STEP_SUMMARY
+          echo "| $(date '+%H:%M:%S') | Web | $WEB_STATUS | ${WEB_WEIGHT}% |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Check if both succeeded
+          if [ "$API_STATUS" = "Succeeded" ] && [ "$WEB_STATUS" = "Succeeded" ]; then
+            echo "✅ Canary deployment completed successfully!"
+            echo "canary_status=success" >> $GITHUB_OUTPUT
+            break
+          fi
+          
+          # Check if either failed
+          if [ "$API_STATUS" = "Failed" ] || [ "$WEB_STATUS" = "Failed" ]; then
+            echo "::error::Canary deployment failed!"
+            echo "canary_status=failed" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+          
+          sleep 30
+        done
+
+    - name: Notify Canary Start
+      uses: slackapi/slack-github-action@v1.24.0
+      with:
+        payload: |
+          {
+            "text": "🚀 Canary deployment started for TaskFlow Pro",
+            "blocks": [
+              {
+                "type": "header",
+                "text": {
+                  "type": "plain_text",
+                  "text": "🚀 Canary Deployment Started"
+                }
+              },
+              {
+                "type": "section",
+                "fields": [
+                  {
+                    "type": "mrkdwn",
+                    "text": "*Version:*\n${{ github.ref_name }}"
+                  },
+                  {
+                    "type": "mrkdwn",
+                    "text": "*Commit:*\n<https://github.com/${{ github.repository }}/commit/${{ github.sha }}|${{ github.sha }}>"
+                  },
+                  {
+                    "type": "mrkdwn",
+                    "text": "*Environment:*\nProduction (Canary)"
+                  },
+                  {
+                    "type": "mrkdwn",
+                    "text": "*Started by:*\n${{ github.actor }}"
+                  }
+                ]
+              },
+              {
+                "type": "actions",
+                "elements": [
+                  {
+                    "type": "button",
+                    "text": {
+                      "type": "plain_text",
+                      "text": "View Dashboard"
+                    },
+                    "url": "https://grafana.taskflow.pro/d/canary"
+                  },
+                  {
+                    "type": "button",
+                    "text": {
+                      "type": "plain_text",
+                      "text": "View Logs"
+                    },
+                    "url": "https://logs.taskflow.pro"
+                  }
+                ]
+              }
+            ]
+          }
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_DEPLOYMENTS_WEBHOOK }}
+
+  # ==========================================
+  # CANARY ANALYSIS & VALIDATION
+  # ==========================================
+  canary-analysis:
+    name: Canary Analysis
+    needs: [canary-deploy]
+    if: needs.canary-deploy.outputs.canary_status == 'success'
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: us-east-1
+
+    - name: Run Metric Analysis
+      run: |
+        # Install required tools
+        pip install prometheus-api-client pandas requests
+        
+        # Run analysis script
+        python scripts/canary_analysis.py \
+          --prometheus-url ${{ secrets.PROMETHEUS_URL }} \
+          --start-time ${{ github.event.repository.updated_at }} \
+          --services taskflow-api,taskflow-web \
+          --output canary-analysis.json
+        
+        # Upload results
+        echo "analysis_results=$(cat canary-analysis.json)" >> $GITHUB_OUTPUT
+
+    - name: Generate Report
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const fs = require('fs');
+          const analysis = JSON.parse(fs.readFileSync('canary-analysis.json', 'utf8'));
+          
+          const report = `## 📊 Canary Analysis Report
+          
+          ### Summary
+          | Metric | Canary | Baseline | Delta | Status |
+          |--------|--------|----------|-------|--------|
+          | Error Rate | ${analysis.canary.error_rate}% | ${analysis.baseline.error_rate}% | ${analysis.delta.error_rate}% | ${analysis.status.error_rate} |
+          | P99 Latency | ${analysis.canary.p99_latency}ms | ${analysis.baseline.p99_latency}ms | ${analysis.delta.p99_latency}ms | ${analysis.status.latency} |
+          | Throughput | ${analysis.canary.throughput} req/s | ${analysis.baseline.throughput} req/s | ${analysis.delta.throughput}% | ${analysis.status.throughput} |
+          
+          ### Recommendation
+          ${analysis.recommendation}
+          
+          [View Full Report](https://grafana.taskflow.pro/d/canary-analysis)
+          `;
+          
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: report
+          });
+
+  # ==========================================
+  # FULL PRODUCTION PROMOTION
+  # ==========================================
+  promote-production:
+    name: Promote to Full Production
+    needs: [canary-deploy, canary-analysis]
+    if: needs.canary-deploy.outputs.canary_status == 'success'
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://app.taskflow.pro
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: us-east-1
+
+    - name: Promote Canary
+      run: |
+        # Flagger automatically promotes when canary succeeds
+        # This step verifies the promotion
+        kubectl get canary taskflow-api -n production -o yaml
+        kubectl get canary taskflow-web -n production -o yaml
+        
+        # Verify all pods are running new version
+        kubectl get pods -n production -l app=taskflow-api -o jsonpath='{.items[*].spec.containers[0].image}'
+        kubectl get pods -n production -l app=taskflow-web -o jsonpath='{.items[*].spec.containers[0].image}'
+
+    - name: Post-Deployment Verification
+      run: |
+        # Wait for all pods to be ready
+        kubectl wait --for=condition=ready pod -l app=taskflow-api -n production --timeout=300s
+        kubectl wait --for=condition=ready pod -l app=taskflow-web -n production --timeout=300s
+        
+        # Run health checks
+        curl -sf https://api.taskflow.pro/health/ready || exit 1
+        curl -sf https://app.taskflow.pro/ready || exit 1
+        
+        # Run synthetic tests
+        cd tests/e2e
+        npm install
+        npm run test:production -- --grep "critical-path"
+
+    - name: Notify Success
+      uses: slackapi/slack-github-action@v1.24.0
+      with:
+        payload: |
+          {
+            "text": "✅ TaskFlow Pro deployed to production successfully!",
+            "blocks": [
+              {
+                "type": "header",
+                "text": {
+                  "type": "plain_text",
+                  "text": "✅ Production Deployment Complete"
+                }
+              },
+              {
+                "type": "section",
+                "fields": [
+                  {
+                    "type": "mrkdwn",
+                    "text": "*Version:*\n${{ github.ref_name }}"
+                  },
+                  {
+                    "type": "mrkdwn",
+                    "text": "*Commit:*\n<https://github.com/${{ github.repository }}/commit/${{ github.sha }}|${{ github.sha }}>"
+                  },
+                  {
+                    "type": "mrkdwn",
+                    "text": "*Duration:*\n${{ job.duration }}"
+                  },
+                  {
+                    "type": "mrkdwn",
+                    "text": "*Deployed by:*\n${{ github.actor }}"
+                  }
+                ]
+              }
+            ]
+          }
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_DEPLOYMENTS_WEBHOOK }}
+
+  # ==========================================
+  # ROLLBACK HANDLING
+  # ==========================================
+  rollback:
+    name: Rollback Deployment
+    needs: [canary-deploy]
+    if: failure() && needs.canary-deploy.outputs.canary_status == 'failed'
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: us-east-1
+
+    - name: Execute Rollback
+      run: |
+        # Rollback API
+        kubectl rollout undo deployment/taskflow-api -n production
+        
+        # Rollback Web
+        kubectl rollout undo deployment/taskflow-web -n production
+        
+        # Wait for rollback to complete
+        kubectl rollout status deployment/taskflow-api -n production --timeout=300s
+        kubectl rollout status deployment/taskflow-web -n production --timeout=300s
+
+    - name: Verify Rollback
+      run: |
+        # Verify old version is running
+        kubectl get pods -n production -l app=taskflow-api -o jsonpath='{.items[*].spec.containers[0].image}'
+        
+        # Health check
+        curl -sf https://api.taskflow.pro/health/ready || exit 1
+
+    - name: Notify Rollback
+      uses: slackapi/slack-github-action@v1.24.0
+      with:
+        payload: |
+          {
+            "text": "🚨 TaskFlow Pro production deployment rolled back!",
+            "blocks": [
+              {
+                "type": "header",
+                "text": {
+                  "type": "plain_text",
+                  "text": "🚨 Automatic Rollback Executed"
+                }
+              },
+              {
+                "type": "section",
+                "text": {
+                  "type": "mrkdwn",
+                  "text": "The canary deployment failed health checks and was automatically rolled back to the previous stable version."
+                }
+              },
+              {
+                "type": "section",
+                "fields": [
+                  {
+                    "type": "mrkdwn",
+                    "text": "*Failed Version:*\n${{ github.ref_name }}"
+                  },
+                  {
+                    "type": "mrkdwn",
+                    "text": "*Rolled back by:*\nGitHub Actions"
+                  }
+                ]
+              },
+              {
+                "type": "actions",
+                "elements": [
+                  {
+                    "type": "button",
+                    "text": {
+                      "type": "plain_text",
+                      "text": "View Logs"
+                    },
+                    "url": "https://logs.taskflow.pro"
+                  },
+                  {
+                    "type": "button",
+                    "text": {
+                      "type": "plain_text",
+                      "text": "View Metrics"
+                    },
+                    "url": "https://grafana.taskflow.pro/d/canary"
+                  }
+                ]
+              }
+            ]
+          }
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_ALERTS_WEBHOOK }}
+
+    - name: Create Incident Issue
+      uses: actions/github-script@v7
+      with:
+        script: |
+          await github.rest.issues.create({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            title: `🚨 Production Rollback: ${context.payload.ref}`,
+            body: `## Automatic Rollback Executed
+            
+            The canary deployment for version \`${context.payload.ref}\` failed and was automatically rolled back.
+            
+            ### Details
+            - **Commit:** ${context.sha}
+            - **Triggered by:** ${context.actor}
+            - **Time:** ${new Date().toISOString()}
+            
+            ### Next Steps
+            1. Review canary metrics and logs
+            2. Identify root cause of failure
+            3. Fix issues and redeploy
+            
+            ### Links
+            - [Actions Run](${context.payload.repository.html_url}/actions/runs/${context.runId})
+            - [Grafana Dashboard](https://grafana.taskflow.pro/d/canary)
+            - [Logs](https://logs.taskflow.pro)
+            
+            cc: @on-call-engineer`,
+            labels: ['incident', 'rollback', 'production', 'canary']
+          });
