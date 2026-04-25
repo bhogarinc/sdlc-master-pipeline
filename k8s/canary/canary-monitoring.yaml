@@ -1,0 +1,396 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: taskflow-canary-alerts
+  namespace: monitoring
+  labels:
+    app: taskflow
+    component: canary
+spec:
+  groups:
+  - name: canary-health
+    interval: 30s
+    rules:
+    # Canary Success Rate Alert
+    - alert: CanaryHighErrorRate
+      expr: |
+        (
+          sum(rate(http_requests_total{service=~"taskflow-.*-canary",status=~"5.."}[5m]))
+          /
+          sum(rate(http_requests_total{service=~"taskflow-.*-canary"}[5m]))
+        ) > 0.01
+      for: 2m
+      labels:
+        severity: critical
+        team: platform
+        service: canary
+      annotations:
+        summary: "Canary deployment showing high error rate"
+        description: "Canary {{ $labels.service }} has {{ $value | humanizePercentage }} error rate over last 5 minutes"
+        runbook_url: "https://wiki.internal/runbooks/canary-high-error-rate"
+        action: "Investigate canary health and consider rollback"
+    
+    # Canary Latency Alert
+    - alert: CanaryHighLatency
+      expr: |
+        histogram_quantile(0.99,
+          sum(rate(http_request_duration_seconds_bucket{service=~"taskflow-.*-canary"}[5m])) by (le)
+        ) > 2
+      for: 3m
+      labels:
+        severity: warning
+        team: platform
+        service: canary
+      annotations:
+        summary: "Canary deployment showing high latency"
+        description: "Canary {{ $labels.service }} P99 latency is {{ $value }}s"
+        runbook_url: "https://wiki.internal/runbooks/canary-high-latency"
+    
+    # Canary vs Baseline Comparison
+    - alert: CanaryPerformanceRegression
+      expr: |
+        (
+          histogram_quantile(0.95,
+            sum(rate(http_request_duration_seconds_bucket{service=~"taskflow-.*-canary"}[5m])) by (le)
+          )
+          /
+          histogram_quantile(0.95,
+            sum(rate(http_request_duration_seconds_bucket{service=~"taskflow-.*",service!~".*-canary"}[5m])) by (le)
+          )
+        ) > 1.5
+      for: 5m
+      labels:
+        severity: warning
+        team: platform
+        service: canary
+      annotations:
+        summary: "Canary showing 50% latency regression vs baseline"
+        description: "Canary latency is {{ $value }}x higher than stable version"
+    
+    # Canary Error Rate Comparison
+    - alert: CanaryErrorRateRegression
+      expr: |
+        (
+          (
+            sum(rate(http_requests_total{service=~"taskflow-.*-canary",status=~"5.."}[5m]))
+            /
+            sum(rate(http_requests_total{service=~"taskflow-.*-canary"}[5m]))
+          )
+          /
+          (
+            sum(rate(http_requests_total{service=~"taskflow-.*",status=~"5..",service!~".*-canary"}[5m]))
+            /
+            sum(rate(http_requests_total{service=~"taskflow-.*",service!~".*-canary"}[5m]))
+          )
+        ) > 2
+      for: 3m
+      labels:
+        severity: critical
+        team: platform
+        service: canary
+      annotations:
+        summary: "Canary error rate 2x higher than baseline"
+        description: "Canary {{ $labels.service }} error rate regression detected"
+    
+    # Canary Pod Health
+    - alert: CanaryPodCrashLooping
+      expr: |
+        rate(kube_pod_container_status_restarts_total{pod=~"taskflow-.*-canary-.*"}[10m]) > 0
+      for: 5m
+      labels:
+        severity: critical
+        team: platform
+        service: canary
+      annotations:
+        summary: "Canary pod crash looping"
+        description: "Canary pod {{ $labels.pod }} has restarted {{ $value }} times/min"
+    
+    # Canary Resource Saturation
+    - alert: CanaryHighMemoryUsage
+      expr: |
+        (
+          container_memory_working_set_bytes{pod=~"taskflow-.*-canary-.*",container!=""}
+          /
+          container_spec_memory_limit_bytes{pod=~"taskflow-.*-canary-.*",container!=""}
+        ) > 0.9
+      for: 5m
+      labels:
+        severity: warning
+        team: platform
+        service: canary
+      annotations:
+        summary: "Canary pod memory usage critical"
+        description: "Canary pod {{ $labels.pod }} using {{ $value | humanizePercentage }} memory"
+    
+    # Canary Stuck in Progress
+    - alert: CanaryStuck
+      expr: |
+        flagger_canary_status{status=~"Progressing|Waiting"} == 1
+        and
+        time() - flagger_canary_last_transition_timestamp > 3600
+      for: 5m
+      labels:
+        severity: warning
+        team: platform
+        service: canary
+      annotations:
+        summary: "Canary deployment stuck for over 1 hour"
+        description: "Canary {{ $labels.name }} has been in {{ $labels.status }} for over 1 hour"
+
+  - name: canary-progression
+    interval: 1m
+    rules:
+    # Canary Progression Notification
+    - alert: CanaryProgressionStarted
+      expr: |
+        flagger_canary_status{status="Progressing"} == 1
+        and
+        flagger_canary_weight > 0
+      labels:
+        severity: info
+        team: platform
+        service: canary
+      annotations:
+        summary: "Canary deployment started"
+        description: "Canary {{ $labels.name }} started with {{ $labels.weight }}% traffic"
+    
+    # Canary Promotion Notification
+    - alert: CanaryPromoted
+      expr: |
+        flagger_canary_status{status="Succeeded"} == 1
+      labels:
+        severity: info
+        team: platform
+        service: canary
+      annotations:
+        summary: "Canary deployment promoted successfully"
+        description: "Canary {{ $labels.name }} has been promoted to 100%"
+    
+    # Canary Rollback Notification
+    - alert: CanaryRolledBack
+      expr: |
+        flagger_canary_status{status="Failed"} == 1
+      labels:
+        severity: critical
+        team: platform
+        service: canary
+      annotations:
+        summary: "Canary deployment rolled back"
+        description: "Canary {{ $labels.name }} has been rolled back. Check logs for details."
+
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: taskflow-canary-metrics
+  namespace: monitoring
+  labels:
+    app: taskflow
+    component: canary
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/part-of: taskflow
+  namespaceSelector:
+    matchNames:
+    - production
+  endpoints:
+  - port: metrics
+    path: /metrics
+    interval: 15s
+    scrapeTimeout: 10s
+    honorLabels: true
+    metricRelabelings:
+    - sourceLabels: [__name__]
+      regex: 'flagger_.*'
+      action: keep
+    - sourceLabels: [service]
+      regex: 'taskflow-.*-canary'
+      action: keep
+
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: taskflow-canary-pods
+  namespace: monitoring
+  labels:
+    app: taskflow
+    component: canary
+spec:
+  selector:
+    matchLabels:
+      app: taskflow-api
+  namespaceSelector:
+    matchNames:
+    - production
+  podMetricsEndpoints:
+  - port: metrics
+    path: /metrics
+    interval: 15s
+    scrapeTimeout: 10s
+    relabelings:
+    - sourceLabels: [__meta_kubernetes_pod_label_version]
+      targetLabel: version
+    - sourceLabels: [__meta_kubernetes_pod_label_app]
+      targetLabel: service
+
+---
+apiVersion: grafana.integreatly.org/v1beta1
+kind: GrafanaDashboard
+metadata:
+  name: taskflow-canary-dashboard
+  namespace: monitoring
+spec:
+  instanceSelector:
+    matchLabels:
+      dashboards: "grafana"
+  folder: "TaskFlow/Canary"
+  datasources:
+    - inputName: "DS_PROMETHEUS"
+      datasourceName: "Prometheus"
+  json: |
+    {
+      "dashboard": {
+        "title": "TaskFlow Canary Deployment",
+        "tags": ["canary", "deployment", "taskflow"],
+        "timezone": "UTC",
+        "schemaVersion": 36,
+        "refresh": "30s",
+        "panels": [
+          {
+            "id": 1,
+            "title": "Canary Traffic Split",
+            "type": "stat",
+            "targets": [
+              {
+                "expr": "flagger_canary_weight{name=~\"taskflow-.*\"}",
+                "legendFormat": "{{ name }} - {{ weight }}%"
+              }
+            ],
+            "fieldConfig": {
+              "defaults": {
+                "unit": "percent",
+                "thresholds": {
+                  "steps": [
+                    {"color": "green", "value": 0},
+                    {"color": "yellow", "value": 25},
+                    {"color": "orange", "value": 50},
+                    {"color": "red", "value": 75}
+                  ]
+                }
+              }
+            },
+            "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0}
+          },
+          {
+            "id": 2,
+            "title": "Canary vs Baseline - Error Rate",
+            "type": "timeseries",
+            "targets": [
+              {
+                "expr": "sum(rate(http_requests_total{service=~\"taskflow-.*-canary\",status=~\"5..\"}[5m])) / sum(rate(http_requests_total{service=~\"taskflow-.*-canary\"}[5m]))",
+                "legendFormat": "Canary Error Rate"
+              },
+              {
+                "expr": "sum(rate(http_requests_total{service=~\"taskflow-.*\",service!~\".*-canary\",status=~\"5..\"}[5m])) / sum(rate(http_requests_total{service=~\"taskflow-.*\",service!~\".*-canary\"}[5m]))",
+                "legendFormat": "Baseline Error Rate"
+              }
+            ],
+            "gridPos": {"h": 8, "w": 12, "x": 6, "y": 0}
+          },
+          {
+            "id": 3,
+            "title": "Canary vs Baseline - Latency P99",
+            "type": "timeseries",
+            "targets": [
+              {
+                "expr": "histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket{service=~\"taskflow-.*-canary\"}[5m])) by (le))",
+                "legendFormat": "Canary P99"
+              },
+              {
+                "expr": "histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket{service=~\"taskflow-.*\",service!~\".*-canary\"}[5m])) by (le))",
+                "legendFormat": "Baseline P99"
+              }
+            ],
+            "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8}
+          },
+          {
+            "id": 4,
+            "title": "Canary Status Timeline",
+            "type": "table",
+            "targets": [
+              {
+                "expr": "flagger_canary_status",
+                "format": "table",
+                "instant": true
+              }
+            ],
+            "gridPos": {"h": 6, "w": 24, "x": 0, "y": 16}
+          }
+        ]
+      }
+    }
+
+---
+apiVersion: monitoring.coreos.com/v1alpha1
+kind: AlertmanagerConfig
+metadata:
+  name: taskflow-canary-notifications
+  namespace: monitoring
+  labels:
+    alertmanagerConfig: taskflow
+spec:
+  route:
+    receiver: canary-notifications
+    groupBy: ['alertname', 'service', 'severity']
+    groupWait: 30s
+    groupInterval: 5m
+    repeatInterval: 12h
+    matchers:
+    - name: service
+      value: canary
+      matchType: "="
+  receivers:
+  - name: canary-notifications
+    slackConfigs:
+    - apiURL:
+        name: slack-webhook-secret
+        key: webhook-url
+      channel: '#deployments'
+      title: '{{ range .Alerts }}{{ .Annotations.summary }}{{ end }}'
+      text: |
+        {{ range .Alerts }}
+        *Alert:* {{ .Annotations.summary }}
+        *Description:* {{ .Annotations.description }}
+        *Severity:* {{ .Labels.severity }}
+        *Service:* {{ .Labels.service }}
+        {{ if .Annotations.runbook_url }}
+        *Runbook:* {{ .Annotations.runbook_url }}
+        {{ end }}
+        {{ end }}
+      sendResolved: true
+    pagerdutyConfigs:
+    - serviceKey:
+        name: pagerduty-service-key
+        key: service-key
+      severity: '{{ .CommonLabels.severity }}'
+      description: '{{ .CommonAnnotations.summary }}'
+      details:
+        - key: firing
+          value: '{{ template "pagerduty.default.instances" .Alerts.Firing }}'
+        - key: resolved
+          value: '{{ template "pagerduty.default.instances" .Alerts.Resolved }}'
+        - key: num_firing
+          value: '{{ .Alerts.Firing | len }}'
+        - key: num_resolved
+          value: '{{ .Alerts.Resolved | len }}'
+    webhookConfigs:
+    - url: 'https://api.taskflow.pro/webhooks/alerts/canary'
+      sendResolved: true
+      httpConfig:
+        authorization:
+          type: Bearer
+          credentials:
+            name: webhook-auth-token
+            key: token
