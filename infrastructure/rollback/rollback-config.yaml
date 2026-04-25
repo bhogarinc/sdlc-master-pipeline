@@ -1,0 +1,246 @@
+# TaskFlow Pro Rollback Configuration
+# ===================================
+# Central configuration for all rollback procedures
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rollback-config
+  namespace: taskflow-pro
+  labels:
+    app: rollback-manager
+    component: disaster-recovery
+data:
+  config.yaml: |
+    # Rollback Manager Configuration
+    version: "1.0.0"
+    
+    # Deployment State Machine Configuration
+    state_machine:
+      persistence:
+        type: file
+        path: /var/lib/rollback/state
+        backup_interval_seconds: 30
+      
+      timeouts:
+        deploying_to_canary: 300  # 5 minutes
+        canary_to_stable: 600     # 10 minutes
+        rollback_max_duration: 900  # 15 minutes
+    
+    # Component Rollback Configuration
+    components:
+      backend:
+        type: kubernetes
+        deployment_name: taskflow-backend
+        namespace: taskflow-pro
+        replicas: 3
+        health_check:
+          endpoint: /api/v1/health
+          timeout_seconds: 10
+          retries: 3
+        rollback_strategy: rolling
+        max_surge: 1
+        max_unavailable: 0
+      
+      frontend:
+        type: kubernetes
+        deployment_name: taskflow-frontend
+        namespace: taskflow-pro
+        replicas: 2
+        health_check:
+          endpoint: /health
+          timeout_seconds: 5
+          retries: 3
+        rollback_strategy: rolling
+      
+      worker:
+        type: kubernetes
+        deployment_name: taskflow-worker
+        namespace: taskflow-pro
+        replicas: 2
+        health_check:
+          command: ["python", "-c", "import celery; print('OK')"]
+          timeout_seconds: 30
+        rollback_strategy: recreate
+      
+      websocket:
+        type: kubernetes
+        deployment_name: taskflow-websocket
+        namespace: taskflow-pro
+        replicas: 2
+        health_check:
+          endpoint: /ws/health
+          timeout_seconds: 5
+        rollback_strategy: rolling
+        graceful_shutdown_seconds: 30  # Allow connections to migrate
+      
+      database:
+        type: postgresql
+        host: taskflow-db.taskflow-pro.svc.cluster.local
+        port: 5432
+        database: taskflow_pro
+        migrations_table: schema_migrations
+        rollback_table: migration_rollbacks
+        backup:
+          enabled: true
+          storage_class: fast-ssd
+          retention_days: 30
+          schedule: "0 2 * * *"  # Daily at 2 AM
+          immediate_backup_on_deploy: true
+      
+      config:
+        type: s3
+        bucket: taskflow-pro-configs
+        region: us-east-1
+        versioning: enabled
+        cache_ttl_seconds: 300
+    
+    # Automated Rollback Triggers
+    auto_rollback:
+      enabled: true
+      monitoring_interval_seconds: 30
+      
+      triggers:
+        health_check_failure:
+          enabled: true
+          consecutive_failures: 3
+          failure_threshold_percentage: 50
+          evaluation_window_seconds: 120
+        
+        error_rate_threshold:
+          enabled: true
+          threshold_percentage: 5.0
+          minimum_requests: 100
+          evaluation_window_seconds: 300
+        
+        latency_threshold:
+          enabled: true
+          p99_threshold_ms: 2000
+          p95_threshold_ms: 1000
+          evaluation_window_seconds: 300
+        
+        canary_rejection:
+          enabled: true
+          error_rate_threshold: 2.0
+          latency_threshold_ms: 1500
+        
+        database_migration_failure:
+          enabled: true
+          auto_rollback: false  # Manual approval required
+          notification_channels:
+            - pagerduty
+            - slack
+        
+        infrastructure_failure:
+          enabled: true
+          pod_crash_loop_threshold: 3
+          resource_exhaustion_threshold: 90
+    
+    # Manual Override Configuration
+    manual_override:
+      authorization:
+        required_roles:
+          - release-engineer
+          - sre-oncall
+          - engineering-manager
+        mfa_required: true
+        approval_timeout_minutes: 30
+      
+      procedures:
+        emergency_rollback:
+          description: "Immediate rollback without safety checks"
+          authorization_level: senior-sre
+          bypass_health_checks: true
+          notification_channels:
+            - pagerduty-critical
+            - slack-alerts
+            - email-oncall
+        
+        graceful_rollback:
+          description: "Standard rollback with full safety checks"
+          authorization_level: release-engineer
+          bypass_health_checks: false
+          drain_connections: true
+          graceful_period_seconds: 60
+    
+    # Post-Rollback Validation
+    validation:
+      health_checks:
+        enabled: true
+        timeout_seconds: 300
+        interval_seconds: 10
+        required_passes: 3
+      
+      smoke_tests:
+        enabled: true
+        test_suite: rollback-smoke-tests
+        timeout_seconds: 600
+        critical_paths:
+          - user_authentication
+          - task_creation
+          - task_assignment
+          - real_time_notifications
+          - team_invitation
+      
+      data_integrity:
+        enabled: true
+        checks:
+          - table_row_counts
+          - foreign_key_integrity
+          - index_consistency
+          - sequence_validity
+        
+      performance_validation:
+        enabled: true
+        baseline_comparison: true
+        acceptable_degradation_percentage: 10
+    
+    # Notification Configuration
+    notifications:
+      slack:
+        webhook_url_secret: slack-webhook-url
+        channels:
+          deployments: "#deployments"
+          alerts: "#sre-alerts"
+          incidents: "#incidents"
+      
+      pagerduty:
+        integration_key_secret: pagerduty-integration-key
+        severity_mapping:
+          rollback_initiated: warning
+          rollback_failed: critical
+          auto_rollback_triggered: error
+      
+      email:
+        smtp_config_secret: smtp-config
+        recipients:
+          - sre-team@taskflow.pro
+          - oncall@taskflow.pro
+      
+    # Rollback Reports
+    reporting:
+      storage:
+        type: s3
+        bucket: taskflow-pro-rollback-reports
+        retention_days: 365
+      
+      formats:
+        - json
+        - html
+        - markdown
+      
+      dashboard:
+        enabled: true
+        grafana_url: https://grafana.taskflow.pro/d/rollback-dashboard
+    
+    # Safety Limits
+    safety:
+      max_rollbacks_per_hour: 3
+      cooldown_period_minutes: 10
+      require_backup_before_migration: true
+      require_approval_for_production: true
+      
+      protected_resources:
+        - production-database
+        - user-data-encryption-keys
+        - payment-processing-config
