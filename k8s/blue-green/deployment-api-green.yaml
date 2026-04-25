@@ -1,0 +1,122 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: taskflow-api
+  namespace: taskflow-green
+  labels:
+    app: taskflow-api
+    environment: green
+    version: "{{VERSION}}"
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: taskflow-api
+      environment: green
+  template:
+    metadata:
+      labels:
+        app: taskflow-api
+        environment: green
+        version: "{{VERSION}}"
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: taskflow-api-sa
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+      - name: api
+        image: bhogarinc/taskflow-api:{{VERSION}}
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8000
+          name: http
+          protocol: TCP
+        - containerPort: 9090
+          name: metrics
+          protocol: TCP
+        envFrom:
+        - configMapRef:
+            name: taskflow-api-config
+        env:
+        - name: DB_HOST
+          valueFrom:
+            secretKeyRef:
+              name: taskflow-db-credentials
+              key: host
+        - name: DB_PORT
+          valueFrom:
+            secretKeyRef:
+              name: taskflow-db-credentials
+              key: port
+        - name: DB_NAME
+          valueFrom:
+            secretKeyRef:
+              name: taskflow-db-credentials
+              key: dbname
+        - name: DB_USER
+          valueFrom:
+            secretKeyRef:
+              name: taskflow-db-credentials
+              key: user
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: taskflow-db-credentials
+              key: password
+        - name: REDIS_URL
+          valueFrom:
+            secretKeyRef:
+              name: taskflow-cache-credentials
+              key: url
+        - name: JWT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: taskflow-jwt-secret
+              key: secret
+        resources:
+          requests:
+            cpu: 500m
+            memory: 512Mi
+          limits:
+            cpu: 1000m
+            memory: 1Gi
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8000
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+        startupProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          failureThreshold: 30
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+      volumes:
+      - name: tmp
+        emptyDir: {}
