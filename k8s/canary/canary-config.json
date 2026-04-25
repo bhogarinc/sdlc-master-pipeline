@@ -1,0 +1,690 @@
+{
+  "canary_strategy": {
+    "name": "TaskFlow Pro Progressive Canary",
+    "description": "Traffic percentage ramp-up with automated health validation at each stage",
+    "provider": "flagger",
+    "ingress": "nginx",
+    "services": [
+      {
+        "name": "taskflow-api",
+        "type": "backend",
+        "replicas": {
+          "baseline": 5,
+          "canary": 1
+        },
+        "traffic_steps": [
+          {
+            "step": 1,
+            "weight": 1,
+            "duration": "10m",
+            "description": "Initial canary - minimal traffic exposure",
+            "gates": ["health_check", "smoke_test"]
+          },
+          {
+            "step": 2,
+            "weight": 5,
+            "duration": "15m",
+            "description": "Low traffic validation",
+            "gates": ["error_rate_check", "latency_check"]
+          },
+          {
+            "step": 3,
+            "weight": 25,
+            "duration": "20m",
+            "description": "Moderate traffic with full metric analysis",
+            "gates": ["full_metric_comparison", "business_metrics_validation"]
+          },
+          {
+            "step": 4,
+            "weight": 50,
+            "duration": "30m",
+            "description": "Half traffic for extended validation",
+            "gates": ["extended_stability_check", "load_test"]
+          },
+          {
+            "step": 5,
+            "weight": 100,
+            "duration": "0m",
+            "description": "Full promotion - all traffic to new version",
+            "gates": ["final_verification"]
+          }
+        ],
+        "total_duration": "75m",
+        "max_analysis_time": "90m"
+      },
+      {
+        "name": "taskflow-web",
+        "type": "frontend",
+        "replicas": {
+          "baseline": 3,
+          "canary": 1
+        },
+        "traffic_steps": [
+          {
+            "step": 1,
+            "weight": 5,
+            "duration": "10m",
+            "description": "Initial validation with visual regression",
+            "gates": ["lighthouse_check", "visual_regression"]
+          },
+          {
+            "step": 2,
+            "weight": 25,
+            "duration": "15m",
+            "description": "Extended frontend validation",
+            "gates": ["web_vitals_check", "error_tracking"]
+          },
+          {
+            "step": 3,
+            "weight": 50,
+            "duration": "20m",
+            "description": "Half traffic for user experience validation",
+            "gates": ["user_session_validation", "performance_comparison"]
+          },
+          {
+            "step": 4,
+            "weight": 100,
+            "duration": "0m",
+            "description": "Full promotion",
+            "gates": ["final_verification"]
+          }
+        ],
+        "total_duration": "45m",
+        "max_analysis_time": "60m"
+      }
+    ],
+    "traffic_splitting": {
+      "method": "weighted_round_robin",
+      "header_based_routing": {
+        "enabled": true,
+        "headers": [
+          {
+            "name": "x-canary",
+            "value": "always",
+            "behavior": "force_canary"
+          },
+          {
+            "name": "cookie",
+            "pattern": "canary=always",
+            "behavior": "force_canary"
+          }
+        ]
+      },
+      "sticky_sessions": {
+        "enabled": true,
+        "cookie_name": "canary_session",
+        "ttl": "24h"
+      }
+    }
+  },
+  "health_checks": [
+    {
+      "name": "liveness_probe",
+      "type": "kubernetes",
+      "endpoint": "/health/live",
+      "port": 8000,
+      "interval": "10s",
+      "timeout": "5s",
+      "failure_threshold": 3,
+      "success_threshold": 1,
+      "initial_delay": "10s",
+      "applies_to": ["taskflow-api"]
+    },
+    {
+      "name": "readiness_probe",
+      "type": "kubernetes",
+      "endpoint": "/health/ready",
+      "port": 8000,
+      "interval": "5s",
+      "timeout": "3s",
+      "failure_threshold": 3,
+      "success_threshold": 2,
+      "initial_delay": "5s",
+      "applies_to": ["taskflow-api", "taskflow-web"]
+    },
+    {
+      "name": "startup_probe",
+      "type": "kubernetes",
+      "endpoint": "/health/startup",
+      "port": 8000,
+      "interval": "5s",
+      "timeout": "3s",
+      "failure_threshold": 30,
+      "success_threshold": 1,
+      "initial_delay": "5s",
+      "applies_to": ["taskflow-api"]
+    },
+    {
+      "name": "pre_rollout_load_test",
+      "type": "webhook",
+      "url": "http://flagger-loadtester.production/",
+      "command": "hey -z 2m -q 10 -c 2 https://api.taskflow.pro/health",
+      "timeout": "30s",
+      "applies_to": ["taskflow-api"]
+    },
+    {
+      "name": "pre_rollout_lighthouse",
+      "type": "webhook",
+      "url": "http://lighthouse-ci.production/",
+      "parameters": {
+        "url": "https://app.taskflow.pro",
+        "thresholds": {
+          "performance": 80,
+          "accessibility": 90,
+          "best_practices": 85,
+          "seo": 80
+        }
+      },
+      "timeout": "120s",
+      "applies_to": ["taskflow-web"]
+    },
+    {
+      "name": "visual_regression",
+      "type": "webhook",
+      "url": "http://percy.production/webhook",
+      "parameters": {
+        "baseline": "production",
+        "threshold": "0.1%"
+      },
+      "timeout": "300s",
+      "applies_to": ["taskflow-web"]
+    },
+    {
+      "name": "post_rollout_smoke_test",
+      "type": "webhook",
+      "url": "http://flagger-loadtester.production/",
+      "command": "curl -sf https://api.taskflow.pro/ready && curl -sf https://api.taskflow.pro/api/v1/tasks",
+      "timeout": "30s",
+      "applies_to": ["taskflow-api"]
+    },
+    {
+      "name": "database_connectivity",
+      "type": "custom",
+      "endpoint": "/health/db",
+      "interval": "30s",
+      "timeout": "5s",
+      "failure_threshold": 3,
+      "applies_to": ["taskflow-api"]
+    },
+    {
+      "name": "cache_connectivity",
+      "type": "custom",
+      "endpoint": "/health/cache",
+      "interval": "30s",
+      "timeout": "3s",
+      "failure_threshold": 3,
+      "applies_to": ["taskflow-api"]
+    }
+  ],
+  "metric_thresholds": {
+    "request_success_rate": {
+      "min": 99.0,
+      "unit": "percent",
+      "window": "1m",
+      "description": "Minimum acceptable success rate for canary"
+    },
+    "request_duration": {
+      "max": 500,
+      "unit": "milliseconds",
+      "window": "1m",
+      "description": "Maximum acceptable average response time"
+    },
+    "error_rate": {
+      "max": 1.0,
+      "unit": "percent",
+      "window": "5m",
+      "description": "Maximum acceptable error rate"
+    },
+    "latency_p99": {
+      "max": 2000,
+      "unit": "milliseconds",
+      "window": "5m",
+      "description": "Maximum acceptable P99 latency"
+    },
+    "latency_p95": {
+      "max": 1000,
+      "unit": "milliseconds",
+      "window": "5m",
+      "description": "Maximum acceptable P95 latency"
+    },
+    "throughput": {
+      "min_ratio": 0.9,
+      "unit": "ratio",
+      "description": "Canary must maintain at least 90% of baseline throughput"
+    },
+    "custom_metrics": {
+      "web_vitals_lcp": {
+        "max": 2500,
+        "unit": "milliseconds",
+        "applies_to": ["taskflow-web"]
+      },
+      "web_vitals_fid": {
+        "max": 100,
+        "unit": "milliseconds",
+        "applies_to": ["taskflow-web"]
+      },
+      "web_vitals_cls": {
+        "max": 0.1,
+        "unit": "score",
+        "applies_to": ["taskflow-web"]
+      }
+    },
+    "comparison_criteria": {
+      "latency_regression_max": 1.5,
+      "error_rate_regression_max": 2.0,
+      "description": "Canary metrics should not exceed 1.5x baseline latency or 2x baseline error rate"
+    }
+  },
+  "rollback_rules": [
+    {
+      "name": "critical_error_rate",
+      "condition": "error_rate > 5%",
+      "severity": "critical",
+      "action": "immediate_rollback",
+      "description": "Rollback if error rate exceeds 5% for 2 consecutive minutes"
+    },
+    {
+      "name": "high_error_rate",
+      "condition": "error_rate > 1%",
+      "duration": "5m",
+      "severity": "high",
+      "action": "rollback",
+      "description": "Rollback if error rate exceeds 1% for 5 minutes"
+    },
+    {
+      "name": "latency_regression",
+      "condition": "p99_latency > 2x baseline",
+      "duration": "3m",
+      "severity": "high",
+      "action": "rollback",
+      "description": "Rollback if P99 latency is more than 2x baseline for 3 minutes"
+    },
+    {
+      "name": "error_rate_regression",
+      "condition": "error_rate > 2x baseline",
+      "duration": "3m",
+      "severity": "high",
+      "action": "rollback",
+      "description": "Rollback if error rate is more than 2x baseline for 3 minutes"
+    },
+    {
+      "name": "pod_crash_loop",
+      "condition": "pod_restarts > 0",
+      "duration": "5m",
+      "severity": "critical",
+      "action": "immediate_rollback",
+      "description": "Rollback if any canary pod is crash looping"
+    },
+    {
+      "name": "memory_saturation",
+      "condition": "memory_usage > 90%",
+      "duration": "5m",
+      "severity": "warning",
+      "action": "alert_only",
+      "description": "Alert but do not rollback on memory pressure"
+    },
+    {
+      "name": "health_check_failure",
+      "condition": "readiness_probe_failures > 3",
+      "severity": "critical",
+      "action": "immediate_rollback",
+      "description": "Rollback if health checks consistently fail"
+    },
+    {
+      "name": "canary_stuck",
+      "condition": "status == 'Progressing'",
+      "duration": "90m",
+      "severity": "warning",
+      "action": "manual_intervention",
+      "description": "Alert if canary is stuck in progressing state for over 90 minutes"
+    }
+  ],
+  "feature_flag_coordination": {
+    "provider": "launchdarkly",
+    "enabled": true,
+    "flags": [
+      {
+        "name": "new-task-ui",
+        "key": "new-task-ui",
+        "description": "Enable new task creation UI",
+        "default_value": false,
+        "canary_override": {
+          "enabled": true,
+          "target": "canary_only",
+          "percentage": 100
+        },
+        "services": ["taskflow-web"]
+      },
+      {
+        "name": "websocket-notifications",
+        "key": "websocket-notifications",
+        "description": "Enable real-time WebSocket notifications",
+        "default_value": false,
+        "canary_override": {
+          "enabled": true,
+          "target": "canary_only",
+          "percentage": 100
+        },
+        "services": ["taskflow-api", "taskflow-web"]
+      },
+      {
+        "name": "enhanced-search",
+        "key": "enhanced-search",
+        "description": "Enable Elasticsearch-based search",
+        "default_value": false,
+        "canary_override": {
+          "enabled": true,
+          "target": "canary_only",
+          "percentage": 100
+        },
+        "services": ["taskflow-api"]
+      }
+    ],
+    "coordination_rules": {
+      "pre_canary": {
+        "description": "Flags to enable before canary starts",
+        "actions": [
+          "set_canary_flags_to_true",
+          "verify_flag_propagation"
+        ]
+      },
+      "post_promotion": {
+        "description": "Flags to update after successful canary promotion",
+        "actions": [
+          "set_baseline_flags_to_true",
+          "set_canary_flags_to_baseline",
+          "disable_canary_override"
+        ]
+      },
+      "post_rollback": {
+        "description": "Flags to update after rollback",
+        "actions": [
+          "reset_all_flags_to_baseline",
+          "disable_canary_override",
+          "notify_feature_team"
+        ]
+      }
+    },
+    "webhook_integration": {
+      "enabled": true,
+      "url": "https://app.launchdarkly.com/webhook/canary",
+      "events": ["canary_started", "canary_promoted", "canary_rolled_back"],
+      "authentication": {
+        "type": "bearer",
+        "secret_ref": "launchdarkly-webhook-token"
+      }
+    }
+  },
+  "notification_config": {
+    "channels": {
+      "slack": {
+        "enabled": true,
+        "webhook_secret": "slack-deployments-webhook",
+        "channels": {
+          "deployments": "#deployments",
+          "alerts": "#alerts",
+          "platform": "#platform-oncall"
+        }
+      },
+      "pagerduty": {
+        "enabled": true,
+        "service_key_secret": "pagerduty-service-key",
+        "severity_mapping": {
+          "info": "info",
+          "warning": "warning",
+          "critical": "critical"
+        }
+      },
+      "email": {
+        "enabled": true,
+        "recipients": [
+          "platform-team@taskflow.pro",
+          "oncall@taskflow.pro"
+        ],
+        "smtp_config": {
+          "host": "smtp.taskflow.pro",
+          "port": 587,
+          "tls": true
+        }
+      },
+      "webhook": {
+        "enabled": true,
+        "url": "https://api.taskflow.pro/webhooks/deployments",
+        "authentication": {
+          "type": "bearer",
+          "secret_ref": "webhook-auth-token"
+        }
+      }
+    },
+    "events": [
+      {
+        "event": "canary_started",
+        "severity": "info",
+        "channels": ["slack", "webhook"],
+        "recipients": ["#deployments"],
+        "template": "canary_started",
+        "description": "Notify when canary deployment begins"
+      },
+      {
+        "event": "canary_progression",
+        "severity": "info",
+        "channels": ["slack"],
+        "recipients": ["#deployments"],
+        "template": "canary_progression",
+        "description": "Notify at each traffic percentage milestone",
+        "milestones": [1, 5, 25, 50, 100]
+      },
+      {
+        "event": "canary_promoted",
+        "severity": "info",
+        "channels": ["slack", "email", "webhook"],
+        "recipients": ["#deployments", "platform-team@taskflow.pro"],
+        "template": "canary_promoted",
+        "description": "Notify when canary is fully promoted"
+      },
+      {
+        "event": "canary_rolled_back",
+        "severity": "critical",
+        "channels": ["slack", "pagerduty", "email", "webhook"],
+        "recipients": ["#alerts", "#platform-oncall", "oncall@taskflow.pro"],
+        "template": "canary_rollback",
+        "description": "Notify when automatic rollback occurs",
+        "auto_create_incident": true
+      },
+      {
+        "event": "canary_warning",
+        "severity": "warning",
+        "channels": ["slack", "email"],
+        "recipients": ["#deployments", "platform-team@taskflow.pro"],
+        "template": "canary_warning",
+        "description": "Notify on non-critical issues"
+      },
+      {
+        "event": "canary_analysis_complete",
+        "severity": "info",
+        "channels": ["slack"],
+        "recipients": ["#deployments"],
+        "template": "canary_analysis",
+        "description": "Share canary analysis results"
+      }
+    ],
+    "templates": {
+      "canary_started": {
+        "slack": {
+          "text": "🚀 Canary deployment started",
+          "blocks": [
+            {
+              "type": "header",
+              "text": "🚀 Canary Deployment Started"
+            },
+            {
+              "type": "section",
+              "fields": [
+                {"type": "mrkdwn", "text": "*Version:*\n{{version}}"},
+                {"type": "mrkdwn", "text": "*Commit:*\n<{{commit_url}}|{{short_sha}}>"},
+                {"type": "mrkdwn", "text": "*Environment:*\nProduction (Canary)"},
+                {"type": "mrkdwn", "text": "*Started by:*\n{{actor}}"}
+              ]
+            },
+            {
+              "type": "actions",
+              "elements": [
+                {"type": "button", "text": "View Dashboard", "url": "{{grafana_url}}"},
+                {"type": "button", "text": "View Logs", "url": "{{logs_url}}"}
+              ]
+            }
+          ]
+        }
+      },
+      "canary_progression": {
+        "slack": {
+          "text": "📊 Canary traffic increased to {{weight}}%",
+          "blocks": [
+            {
+              "type": "section",
+              "text": "📊 Canary at {{weight}}% traffic"
+            },
+            {
+              "type": "section",
+              "fields": [
+                {"type": "mrkdwn", "text": "*Service:*\n{{service}}"},
+                {"type": "mrkdwn", "text": "*Error Rate:*\n{{error_rate}}%"},
+                {"type": "mrkdwn", "text": "*P99 Latency:*\n{{p99_latency}}ms"},
+                {"type": "mrkdwn", "text": "*Status:*\n{{status}}"}
+              ]
+            }
+          ]
+        }
+      },
+      "canary_promoted": {
+        "slack": {
+          "text": "✅ Canary deployment promoted successfully!",
+          "blocks": [
+            {
+              "type": "header",
+              "text": "✅ Production Deployment Complete"
+            },
+            {
+              "type": "section",
+              "fields": [
+                {"type": "mrkdwn", "text": "*Version:*\n{{version}}"},
+                {"type": "mrkdwn", "text": "*Duration:*\n{{duration}}"},
+                {"type": "mrkdwn", "text": "*Deployed by:*\n{{actor}}"}
+              ]
+            }
+          ]
+        }
+      },
+      "canary_rollback": {
+        "slack": {
+          "text": "🚨 Canary deployment rolled back!",
+          "blocks": [
+            {
+              "type": "header",
+              "text": "🚨 Automatic Rollback Executed"
+            },
+            {
+              "type": "section",
+              "text": "The canary deployment failed health checks and was automatically rolled back."
+            },
+            {
+              "type": "section",
+              "fields": [
+                {"type": "mrkdwn", "text": "*Failed Version:*\n{{version}}"},
+                {"type": "mrkdwn", "text": "*Reason:*\n{{rollback_reason}}"}
+              ]
+            },
+            {
+              "type": "actions",
+              "elements": [
+                {"type": "button", "text": "View Logs", "url": "{{logs_url}}"},
+                {"type": "button", "text": "View Metrics", "url": "{{grafana_url}}"}
+              ]
+            }
+          ]
+        }
+      }
+    }
+  },
+  "deployment_manifest": {
+    "apiVersion": "flagger.app/v1beta1",
+    "kind": "Canary",
+    "metadata": {
+      "name": "taskflow-api",
+      "namespace": "production"
+    },
+    "spec": {
+      "provider": "nginx",
+      "targetRef": {
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "name": "taskflow-api"
+      },
+      "autoscalerRef": {
+        "apiVersion": "autoscaling/v2",
+        "kind": "HorizontalPodAutoscaler",
+        "name": "taskflow-api"
+      },
+      "service": {
+        "port": 8000,
+        "targetPort": 8000,
+        "gateways": ["taskflow-api-gateway"],
+        "hosts": ["api.taskflow.pro"]
+      },
+      "analysis": {
+        "interval": "30s",
+        "threshold": 5,
+        "maxWeight": 100,
+        "stepWeight": 1,
+        "metrics": [
+          {
+            "name": "request-success-rate",
+            "thresholdRange": {"min": 99},
+            "interval": "1m"
+          },
+          {
+            "name": "request-duration",
+            "thresholdRange": {"max": 500},
+            "interval": "1m"
+          }
+        ],
+        "webhooks": [
+          {
+            "name": "load-test",
+            "type": "pre-rollout",
+            "url": "http://flagger-loadtester.production/",
+            "timeout": "30s",
+            "metadata": {
+              "cmd": "hey -z 2m -q 10 -c 2 https://api.taskflow.pro/health"
+            }
+          },
+          {
+            "name": "gate-check",
+            "type": "confirm-promotion",
+            "url": "http://flagger-loadtester.production/gate/check",
+            "timeout": "10s"
+          },
+          {
+            "name": "smoke-test",
+            "type": "post-rollout",
+            "url": "http://flagger-loadtester.production/",
+            "timeout": "30s",
+            "metadata": {
+              "cmd": "curl -sf https://api.taskflow.pro/ready"
+            }
+          },
+          {
+            "name": "rollback-alert",
+            "type": "rollback",
+            "url": "http://flagger-loadtester.production/rollback",
+            "timeout": "5s",
+            "metadata": {
+              "severity": "critical",
+              "channel": "#deployments"
+            }
+          }
+        ]
+      }
+    }
+  }
+}
