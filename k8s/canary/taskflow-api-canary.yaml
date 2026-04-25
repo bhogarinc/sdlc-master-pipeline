@@ -1,0 +1,406 @@
+apiVersion: flagger.app/v1beta1
+kind: Canary
+metadata:
+  name: taskflow-api
+  namespace: production
+  labels:
+    app: taskflow-api
+    version: canary-v1
+spec:
+  provider: nginx
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: taskflow-api
+  autoscalerRef:
+    apiVersion: autoscaling/v2
+    kind: HorizontalPodAutoscaler
+    name: taskflow-api
+  service:
+    port: 8000
+    targetPort: 8000
+    gateways:
+    - taskflow-api-gateway
+    hosts:
+    - api.taskflow.pro
+    trafficPolicy:
+      tls:
+        mode: ISTIO_MUTUAL
+  analysis:
+    # Canary progression schedule
+    interval: 30s
+    threshold: 5
+    maxWeight: 100
+    stepWeight: 5
+    metrics:
+    - name: request-success-rate
+      thresholdRange:
+        min: 99
+      interval: 1m
+    - name: request-duration
+      thresholdRange:
+        max: 500
+      interval: 1m
+    - name: custom-error-rate
+      thresholdRange:
+        max: 1
+      interval: 1m
+      query: |
+        sum(rate(http_requests_total{service="taskflow-api-canary",status=~"5.."}[1m]))
+        /
+        sum(rate(http_requests_total{service="taskflow-api-canary"}[1m])) * 100
+    - name: latency-p99
+      thresholdRange:
+        max: 2000
+      interval: 1m
+      query: |
+        histogram_quantile(0.99,
+          sum(rate(http_request_duration_seconds_bucket{service="taskflow-api-canary"}[1m])) by (le)
+        ) * 1000
+    webhooks:
+    # Pre-rollout acceptance tests
+    - name: load-test
+      type: pre-rollout
+      url: http://flagger-loadtester.production/
+      timeout: 30s
+      metadata:
+        cmd: "hey -z 2m -q 10 -c 2 https://api.taskflow.pro/health"
+    
+    # Confirm traffic increase
+    - name: gate-check
+      type: confirm-promotion
+      url: http://flagger-loadtester.production/gate/check
+      timeout: 10s
+      
+    # Post-rollout verification
+    - name: smoke-test
+      type: post-rollout
+      url: http://flagger-loadtester.production/
+      timeout: 30s
+      metadata:
+        cmd: "curl -sf https://api.taskflow.pro/ready && curl -sf https://api.taskflow.pro/api/v1/tasks"
+    
+    # Rollback notification
+    - name: rollback-alert
+      type: rollback
+      url: http://flagger-loadtester.production/rollback
+      timeout: 5s
+      metadata:
+        severity: critical
+        channel: "#deployments"
+
+  # Progressive traffic shift schedule
+  skipAnalysis: false
+  canaryAnalysis:
+    stepWeight: 1
+    stepWeightPromotion: 100
+    iterations: 10
+    schedule:
+      # Step 1: 1% traffic for 10 minutes
+      - step: 1
+        weight: 1
+        duration: 10m
+      # Step 2: 5% traffic for 15 minutes
+      - step: 2
+        weight: 5
+        duration: 15m
+      # Step 3: 25% traffic for 20 minutes
+      - step: 3
+        weight: 25
+        duration: 20m
+      # Step 4: 50% traffic for 30 minutes
+      - step: 4
+        weight: 50
+        duration: 30m
+      # Step 5: 100% traffic (full promotion)
+      - step: 5
+        weight: 100
+        duration: 0m
+
+  # A/B Testing configuration for specific headers
+  abTesting:
+    enabled: true
+    match:
+      - headers:
+          x-canary:
+            exact: "always"
+      - headers:
+          cookie:
+            regex: "^(.*?;)?(canary=always)(;.*)?$"
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: taskflow-api
+  namespace: production
+  labels:
+    app: taskflow-api
+    version: stable
+spec:
+  replicas: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: taskflow-api
+  template:
+    metadata:
+      labels:
+        app: taskflow-api
+        version: stable
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: taskflow-api-sa
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+      - name: api
+        image: bhogarinc/taskflow-api:latest
+        imagePullPolicy: Always
+        ports:
+        - name: http
+          containerPort: 8000
+          protocol: TCP
+        - name: metrics
+          containerPort: 9090
+          protocol: TCP
+        env:
+        - name: ENVIRONMENT
+          value: "production"
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: taskflow-db-credentials
+              key: database-url
+        - name: REDIS_URL
+          valueFrom:
+            secretKeyRef:
+              name: taskflow-redis-credentials
+              key: redis-url
+        - name: JWT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: taskflow-jwt-secret
+              key: secret
+        - name: FEATURE_FLAGS_URL
+          value: "http://feature-flag-service.production:8080"
+        livenessProbe:
+          httpGet:
+            path: /health/live
+            port: 8000
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+          successThreshold: 1
+        readinessProbe:
+          httpGet:
+            path: /health/ready
+            port: 8000
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+          successThreshold: 2
+        startupProbe:
+          httpGet:
+            path: /health/startup
+            port: 8000
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 30
+          successThreshold: 1
+        resources:
+          requests:
+            cpu: 500m
+            memory: 512Mi
+          limits:
+            cpu: 1000m
+            memory: 1Gi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+        - name: cache
+          mountPath: /app/cache
+      volumes:
+      - name: tmp
+        emptyDir: {}
+      - name: cache
+        emptyDir:
+          sizeLimit: 100Mi
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - taskflow-api
+              topologyKey: kubernetes.io/hostname
+      topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: topology.kubernetes.io/zone
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels:
+            app: taskflow-api
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: taskflow-api
+  namespace: production
+  labels:
+    app: taskflow-api
+spec:
+  type: ClusterIP
+  ports:
+  - port: 8000
+    targetPort: 8000
+    protocol: TCP
+    name: http
+  - port: 9090
+    targetPort: 9090
+    protocol: TCP
+    name: metrics
+  selector:
+    app: taskflow-api
+
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: taskflow-api
+  namespace: production
+  labels:
+    app: taskflow-api
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: taskflow-api
+  minReplicas: 5
+  maxReplicas: 20
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+  - type: Pods
+    pods:
+      metric:
+        name: http_requests_per_second
+      target:
+        type: AverageValue
+        averageValue: "1000"
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+      - type: Percent
+        value: 10
+        periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+      - type: Percent
+        value: 100
+        periodSeconds: 15
+      - type: Pods
+        value: 4
+        periodSeconds: 15
+      selectPolicy: Max
+
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: taskflow-api
+  namespace: production
+spec:
+  minAvailable: 4
+  selector:
+    matchLabels:
+      app: taskflow-api
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: taskflow-api
+  namespace: production
+spec:
+  podSelector:
+    matchLabels:
+      app: taskflow-api
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: ingress-nginx
+    - podSelector:
+        matchLabels:
+          app: nginx-ingress
+    ports:
+    - protocol: TCP
+      port: 8000
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: monitoring
+    ports:
+    - protocol: TCP
+      port: 9090
+  egress:
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: database
+    ports:
+    - protocol: TCP
+      port: 5432
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: cache
+    ports:
+    - protocol: TCP
+      port: 6379
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: feature-flags
+    ports:
+    - protocol: TCP
+      port: 8080
