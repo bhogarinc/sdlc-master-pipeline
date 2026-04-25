@@ -1,2 +1,0 @@
-Tool: SDLC GitHub Manager
-Direct PAT test
